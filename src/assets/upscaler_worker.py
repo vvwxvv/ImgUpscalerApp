@@ -72,14 +72,8 @@ class _TileLogHandler(logging.Handler):
         except Exception:  # never let a handler crash the worker
             pass
 
-
 class _StreamWrapper:
-    """Transparent wrapper for sys.stdout / sys.stderr.
-
-    Forwards all writes unchanged and additionally scans each write for the
-    ``Tile X/Y`` pattern (covers tqdm and plain ``print`` calls from
-    basicsr / real-esrgan internals).
-    """
+    """Transparent wrapper for sys.stdout / sys.stderr."""
 
     def __init__(
         self,
@@ -90,19 +84,21 @@ class _StreamWrapper:
         self._cb   = callback
 
     def write(self, text: str) -> int:
-        result = self._orig.write(text)
-        m = _TILE_RE.search(text)
-        if m:
-            self._cb(int(m.group(1)), int(m.group(2)))
-        return result
+        if self._orig:  # Ensure the original stream is not None
+            result = self._orig.write(text)
+            m = _TILE_RE.search(text)
+            if m:
+                self._cb(int(m.group(1)), int(m.group(2)))
+            return result
+        return 0  # If the original stream is None, do nothing
 
     def flush(self) -> None:
-        self._orig.flush()
+        if self._orig:  # Ensure the original stream is not None
+            self._orig.flush()
 
     def __getattr__(self, name: str):
-        # Transparently forward isatty(), fileno(), encoding, …
-        return getattr(self._orig, name)
-
+        # Transparently forward isatty(), fileno(), encoding, etc.
+        return getattr(self._orig, name) if self._orig else None
 
 class _TileCapture:
     """Context manager that installs all tile-progress interceptors.
