@@ -1,71 +1,252 @@
 """
-main_app.py  –  TinyImgApp  |  Real‑ESRGAN Upscaler
-Elegant, Bauhaus‑style UI matching the image downloader app.
-Uses reusable dialogs from src/uiitems/dialogs.
+main_app.py  –  TinyImgApp | Real-ESRGAN Upscaler
+==================================================
+Single UI entry point.  All bootstrap utilities, path helpers, resize
+logic, styles, and window code live here.
+
+Only two external project splits are imported:
+  src/worker.py                   – UpscaleWorker + ML re-exports
+  src/uiitems/progress_panel.py   – pinned bottom panel widget
+  src/uiitems/close_button.py     – frameless close button
+  src/uiitems/dialogs.py          – AlertDialog / DoneDialog
+
+Window features
+  • Frameless with manual 8-direction edge resize (GRIP_PX border)
+  • QScrollArea body  +  ProgressPanel pinned at the bottom
+  • Max height = 90 % of screen; initial size ≈ 80 %
 """
 
+from __future__ import annotations
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  Windows DLL pre-registration                                               │
+# │  MUST execute before any import that can transitively load torch.           │
+# │  Fixes OSError WinError 1114 – c10.dll / CUDA DLL init failure.            │
+# └─────────────────────────────────────────────────────────────────────────────┘
 import os
 import sys
-from pathlib import Path
-from typing import Optional, List
 
-from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal
+
+def _register_torch_dll_dirs() -> None:
+    """Add torch/lib and CUDA bin dirs to the Windows DLL search path."""
+    if sys.platform != "win32":
+        return
+    candidates: list[str] = []
+    try:
+        import site
+        import sysconfig
+        for sp in site.getsitepackages():
+            candidates.append(os.path.join(sp, "torch", "lib"))
+        purelib = sysconfig.get_path("purelib")
+        if purelib:
+            candidates.append(os.path.join(purelib, "torch", "lib"))
+    except Exception:
+        pass
+    for path in candidates:
+        if os.path.isdir(path):
+            try:
+                os.add_dll_directory(path)
+            except Exception:
+                pass
+    for env_var in ("CUDA_PATH", "CUDA_HOME"):
+        cuda_root = os.environ.get(env_var, "")
+        if cuda_root:
+            for sub in ("bin", "libnvvp"):
+                dll_path = os.path.join(cuda_root, sub)
+                if os.path.isdir(dll_path):
+                    try:
+                        os.add_dll_directory(dll_path)
+                    except Exception:
+                        pass
+            break
+
+
+def _apply_torchvision_shim() -> None:
+    """Shim back the removed torchvision.transforms.functional_tensor module."""
+    key = "torchvision.transforms.functional_tensor"
+    if key in sys.modules:
+        return
+    try:
+        from types import ModuleType
+        import torchvision.transforms.functional as _F
+        mock = ModuleType(key)
+        mock.rgb_to_grayscale = _F.rgb_to_grayscale  # type: ignore[attr-defined]
+        sys.modules[key] = mock
+    except Exception:
+        pass
+
+
+# Run both side-effects immediately – before any other import.
+_register_torch_dll_dirs()
+_apply_torchvision_shim()
+
+# ── Standard library ──────────────────────────────────────────────────────────
+import logging
+from pathlib import Path
+from typing import List, Optional
+
+# ── Qt ────────────────────────────────────────────────────────────────────────
+from PyQt5.QtCore import Qt, QPoint, QRect
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFileDialog, QComboBox,
-    QProgressBar, QRadioButton,
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
-# ── DPI awareness ──
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
-try:
-    import torch
-    import torchvision
-    import torchvision.transforms
-    import torchvision.transforms.functional
-except ImportError as e:
-    print(f"Warning: torch/torchvision not available: {e}")
-
-
-from src.assets.real_esrGAN_upscaler import (
-    RealESRGANUpscaler,
-    UpscalerConfig,
-    MODEL_REGISTRY,
-    IMAGE_EXTENSIONS,
-)
+# ── Project imports ───────────────────────────────────────────────────────────
 from src.uiitems.close_button import CloseButton
 from src.uiitems.dialogs import AlertDialog, DoneDialog
+from src.uiitems.progress_panel import ProgressPanel
+from src.assets.upscaler_worker import (
+    IMAGE_EXTENSIONS,
+    MODEL_REGISTRY,
+    RealESRGANUpscaler,
+    UpscalerConfig,
+    UpscaleWorker,
+)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Bootstrap helpers (logging + paths)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def get_resource_path(relative_path: str) -> str:
+def _setup_logging() -> Path:
+    """Configure root logger (file + console).  Returns the log file path."""
+    log_path: Path = (
+        Path(sys.executable).parent / "upscaler.log"
+        if getattr(sys, "frozen", False)
+        else Path("upscaler.log")
+    )
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    return log_path
+
+
+def _get_resource_path(relative_path: str) -> str:
+    """Resolve *relative_path* against the bundle root (PyInstaller or CWD)."""
     try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    except AttributeError:
+        base = os.path.abspath(".")
+    return os.path.join(base, relative_path)
 
 
-# ── Styles (identical to downloader) ────────────────────────────────────────
+def _get_models_dir() -> str:
+    """Return the absolute models directory, creating it when absent."""
+    base: Path = (
+        Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(".")
+    )
+    d = base / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
 
+
+def _get_cover_path() -> Optional[str]:
+    """Return the path to ``static/cover.png``, or ``None`` if not found."""
+    path = _get_resource_path(os.path.join("static", "cover.png"))
+    if os.path.isfile(path):
+        return path
+    logging.getLogger(__name__).warning("Cover image not found: %s", path)
+    return None
+
+
+# Initialise logging once at module level.
+_LOG_PATH = _setup_logging()
+_log      = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI option data
+# ─────────────────────────────────────────────────────────────────────────────
+_FORMAT_OPTIONS: tuple[str, ...] = ("JPEG", "PNG", "WEBP")
+_SIZE_OPTIONS:   tuple[str, ...] = ("No limit", "500 KB", "700 KB", "1 MB", "2 MB")
+
+
+def _parse_target_kb(text: str) -> Optional[int]:
+    """Convert a size-option label to kilobytes, or ``None`` for *No limit*."""
+    if text == "No limit":
+        return None
+    value, unit = text.split()
+    return int(value) * (1024 if "MB" in unit else 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge-resize direction bitmasks  (module-level constants)
+# ─────────────────────────────────────────────────────────────────────────────
+_RNONE  = 0
+_RLEFT  = 1
+_RRIGHT = 2
+_RTOP   = 4
+_RBOT   = 8
+
+_CURSOR_MAP: dict[int, Qt.CursorShape] = {
+    _RLEFT:             Qt.SizeHorCursor,
+    _RRIGHT:            Qt.SizeHorCursor,
+    _RTOP:              Qt.SizeVerCursor,
+    _RBOT:              Qt.SizeVerCursor,
+    _RTOP | _RLEFT:     Qt.SizeFDiagCursor,
+    _RBOT | _RRIGHT:    Qt.SizeFDiagCursor,
+    _RTOP | _RRIGHT:    Qt.SizeBDiagCursor,
+    _RBOT | _RLEFT:     Qt.SizeBDiagCursor,
+}
+
+GRIP_PX: int = 8   # invisible resize border width in pixels
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stylesheet & inline styles
+# ─────────────────────────────────────────────────────────────────────────────
 STYLESHEET = """
 QWidget#App {
     background-color: #ffffff;
     border: 2px solid #000000;
     border-radius: 20px;
 }
-
+QScrollArea {
+    border: none;
+    background-color: transparent;
+}
+QScrollArea > QWidget > QWidget {
+    background-color: transparent;
+}
+QScrollBar:vertical {
+    background: #f0f0f0;
+    width: 6px;
+    margin: 0;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical {
+    background: #aaaaaa;
+    min-height: 30px;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical:hover { background: #555555; }
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical     { height: 0; }
 QLabel {
     color: #000000;
     background-color: transparent;
     border: none;
     font-size: 14px;
 }
-
 QPushButton {
     background-color: #ffffff;
     color: #000000;
@@ -76,15 +257,12 @@ QPushButton {
     padding: 11px 16px;
     margin: 5px 10px;
 }
-QPushButton:hover {
-    background-color: #f0f0f0;
-}
+QPushButton:hover    { background-color: #f0f0f0; }
 QPushButton:disabled {
     background-color: #f5f5f5;
     color: #aaaaaa;
     border-color: #cccccc;
 }
-
 QComboBox {
     background-color: #ffffff;
     color: #000000;
@@ -105,7 +283,6 @@ QComboBox QAbstractItemView {
     selection-background-color: #000000;
     selection-color: #ffffff;
 }
-
 QRadioButton {
     background-color: #ffffff;
     color: #000000;
@@ -116,9 +293,7 @@ QRadioButton {
     border-radius: 10px;
     border: 2px solid #000000;
 }
-QRadioButton:hover {
-    background-color: #f5f5f5;
-}
+QRadioButton:hover    { background-color: #f5f5f5; }
 QRadioButton:disabled {
     background-color: #f5f5f5;
     color: #aaaaaa;
@@ -135,7 +310,6 @@ QRadioButton::indicator:checked {
     background-color: #000000;
     border-color: #000000;
 }
-
 QProgressBar {
     background-color: #f5f5f5;
     border: 2px solid #000000;
@@ -150,321 +324,339 @@ QProgressBar::chunk {
     background-color: #000000;
     border-radius: 5px;
 }
-"""
-
-SECTION_LABEL_STYLE = (
-    "color: #888888;"
-    "background: transparent;"
-    "border: none;"
-    "font-size: 11px;"
-    "letter-spacing: 1.5px;"
-    "margin: 6px 14px 1px 14px;"
-)
-
-PATH_LABEL_STYLE = (
-    "color: #000000;"
-    "background: transparent;"
-    "border: none;"
-    "font-size: 13px;"
-    "font-weight: 500;"
-    "margin: 0px 14px 4px 14px;"
-)
-
-LOG_STYLE = (
-    "background-color: #f9f9f9;"
-    "border: 2px solid #000000;"
-    "border-radius: 10px;"
-    "padding: 8px 12px;"
-    "margin: 4px 10px;"
-    "color: #000000;"
-    "font-size: 12px;"
-    "font-family: 'Courier New', monospace;"
-)
-
-START_BTN_STYLE = """
-QPushButton {
-    font-size: 15px;
-    font-weight: 700;
-    color: #ffffff;
-    background-color: #000000;
-    border: none;
-    border-radius: 14px;
-    padding: 18px;
-    margin: 10px;
-    letter-spacing: 1px;
-}
-QPushButton:hover {
-    background-color: #222222;
-}
-QPushButton:disabled {
-    background-color: #cccccc;
-    color: #888888;
+QWidget#BottomPanel {
+    background-color: #ffffff;
+    border-top: 2px solid #eeeeee;
+    border-bottom-left-radius: 18px;
+    border-bottom-right-radius: 18px;
 }
 """
 
-
-# ── Worker (unchanged from previous, but we'll keep it here) ──────────────
-
-class UpscaleWorker(QThread):
-    progress = pyqtSignal(int, int)
-    row_done = pyqtSignal(str)
-    finished = pyqtSignal(list)
-    error    = pyqtSignal(str)
-
-    def __init__(self, upscaler, input_paths, output_dir, output_format, target_size_kb):
-        super().__init__()
-        self.upscaler = upscaler
-        self.input_paths = input_paths
-        self.output_dir = Path(output_dir)
-        self.output_format = output_format.lower()
-        self.target_size_kb = target_size_kb
-        self._total = len(input_paths)
-        self._done = 0
-        self.results = []
-
-    def run(self):
-        self.progress.emit(0, self._total)
-        for src in self.input_paths:
-            try:
-                result = self._process_one(Path(src))
-                self.results.append(result)
-                self._done += 1
-                self.progress.emit(self._done, self._total)
-                if result["status"] == "saved":
-                    self.row_done.emit(f"[ OK ]  {Path(src).name}  →  {result['size_kb']:.0f} KB")
-                elif result["status"] == "skipped":
-                    self.row_done.emit(f"[SKIP]  {Path(src).name}  (exists)")
-                else:
-                    self.row_done.emit(f"[FAIL]  {Path(src).name}  → {result['error']}")
-            except Exception as e:
-                self.results.append({
-                    "status": "error",
-                    "filename": Path(src).name,
-                    "size_kb": 0,
-                    "error": str(e),
-                })
-                self._done += 1
-                self.progress.emit(self._done, self._total)
-                self.row_done.emit(f"[FAIL]  {Path(src).name}  → {str(e)}")
-        self.finished.emit(self.results)
-
-    def _process_one(self, src_path: Path) -> dict:
-        from PIL import Image
-        ext_map = {"png": ".png", "jpg": ".jpg", "jpeg": ".jpg", "webp": ".webp"}
-        ext = ext_map.get(self.output_format, ".jpg")
-        out_name = src_path.stem + "_upscaled" + ext
-        out_path = self.output_dir / out_name
-        if out_path.exists():
-            return {"status": "skipped", "filename": out_name, "size_kb": out_path.stat().st_size / 1024, "error": ""}
-        img = self.upscaler.upscale_pil(Image.open(src_path).convert("RGB"))
-        if self.target_size_kb and self.output_format in ("jpg", "jpeg", "webp"):
-            quality = self._find_quality(img, out_path, self.target_size_kb)
-            if self.output_format in ("jpg", "jpeg"):
-                img.save(out_path, quality=quality, optimize=True)
-            else:
-                img.save(out_path, quality=quality, method=6)
-            final_size = out_path.stat().st_size / 1024
-            return {"status": "saved", "filename": out_name, "size_kb": final_size, "error": ""}
-        else:
-            if self.output_format == "png":
-                img.save(out_path, optimize=True)
-            elif self.output_format in ("jpg", "jpeg"):
-                img.save(out_path, quality=95, optimize=True)
-            elif self.output_format == "webp":
-                img.save(out_path, quality=95, method=6)
-            else:
-                raise ValueError(f"Unsupported format: {self.output_format}")
-            size_kb = out_path.stat().st_size / 1024
-            return {"status": "saved", "filename": out_name, "size_kb": size_kb, "error": ""}
-
-    def _find_quality(self, img, out_path, target_kb: int) -> int:
-        low, high = 10, 95
-        best_q = 95
-        ext = out_path.suffix.lower()
-        for _ in range(12):
-            q = (low + high) // 2
-            temp_path = out_path.with_suffix(f".tmp_{q}{ext}")
-            if ext in (".jpg", ".jpeg"):
-                img.save(temp_path, quality=q, optimize=True)
-            else:
-                img.save(temp_path, quality=q, method=6)
-            size_kb = temp_path.stat().st_size / 1024
-            temp_path.unlink()
-            if size_kb <= target_kb:
-                best_q = q
-                low = q + 1
-            else:
-                high = q - 1
-            if high - low <= 2:
-                break
-        return best_q
+_SECTION_STYLE: str = (
+    "color: #888888; background: transparent; border: none;"
+    " font-size: 11px; letter-spacing: 1.5px; margin: 8px 14px 2px 14px;"
+)
+_PATH_STYLE: str = (
+    "color: #000000; background: transparent; border: none;"
+    " font-size: 13px; font-weight: 500; margin: 0px 14px 4px 14px;"
+)
+_MODEL_DESC_STYLE: str = (
+    "color: #888888; font-size: 11px; margin: 0px 14px 4px 14px;"
+)
+_FALLBACK_LOGO_STYLE: str = (
+    "font-size: 22px; font-weight: bold; color: #000000;"
+    " background: transparent; border: none; padding: 18px; margin: 0;"
+)
 
 
-# ── Main Window ──────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Main window
+# ─────────────────────────────────────────────────────────────────────────────
 class UpscalerApp(QWidget):
-    APP_WIDTH  = 540
-    APP_HEIGHT = 900          # same as downloader
+    """Frameless main window for TinyImgApp.
 
-    def __init__(self):
+    Responsibilities:
+      • Render complete interface: cover image, controls, pinned panel.
+      • Handle window dragging and 8-direction edge resizing directly.
+      • Create and supervise UpscaleWorker; relay signals to ProgressPanel.
+      • No ML or file-IO code lives here.
+    """
+
+    MIN_W: int = 420
+    MIN_H: int = 480
+
+    def __init__(self) -> None:
         super().__init__()
-        self._input_paths: List[str] = []
-        self._output_dir: Optional[str] = None
-        self._upscaler: Optional[RealESRGANUpscaler] = None
-        self._worker: Optional[UpscaleWorker] = None
-        self.oldPos = self.pos()
-        self.init_ui()
 
-    def init_ui(self):
+        # Application state
+        self._input_paths: List[str]                    = []
+        self._output_dir:  Optional[str]                = None
+        self._upscaler:    Optional[RealESRGANUpscaler] = None
+        self._worker:      Optional[UpscaleWorker]      = None
+
+        # Window drag state
+        self._drag_pos: Optional[QPoint] = None
+
+        # Edge-resize state
+        self._resize_dir:    int              = _RNONE
+        self._resize_origin: Optional[QPoint] = None
+        self._resize_rect:   Optional[QRect]  = None
+
+        self._init_ui()
+        _log.info("UpscalerApp ready  (log → %s)", _LOG_PATH)
+
+    # =========================================================================
+    # UI construction
+    # =========================================================================
+
+    def _init_ui(self) -> None:
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setObjectName("App")
         self.setStyleSheet(STYLESHEET)
-        self.resize(self.APP_WIDTH, self.APP_HEIGHT)
+        self.setMouseTracking(True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 0)
-        layout.setSpacing(2)
+        screen  = QApplication.primaryScreen().availableGeometry()
+        max_h   = int(screen.height() * 0.90)
+        start_w = min(540, screen.width() - 40)
+        start_h = min(int(screen.height() * 0.80), max_h)
 
-        # Title bar
-        layout.addLayout(self._build_title_bar())
+        self.setMinimumSize(self.MIN_W, self.MIN_H)
+        self.setMaximumSize(screen.width(), max_h)
+        self.resize(start_w, start_h)
 
-        # Logo (cover) – full width, auto height
-        layout.addWidget(self._build_logo())
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addLayout(self._build_title_bar())
+        root.addWidget(self._build_scroll_body(), stretch=1)
+        root.addWidget(self._build_bottom_panel())
+        self.setLayout(root)
 
-        # ── INPUT SOURCE ──────────────────────────────────────────────
-        layout.addWidget(self._section("INPUT SOURCE"))
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    def _build_title_bar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 4, 4, 0)
+        close_btn = CloseButton(self)
+        close_btn.clicked.connect(self.close)
+        bar.addStretch()
+        bar.addWidget(close_btn)
+        return bar
+
+    # ── Scrollable body ───────────────────────────────────────────────────────
+    def _build_scroll_body(self) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        scroll.setMouseTracking(True)
+
+        body = QWidget()
+        body.setObjectName("ScrollContent")
+        body.setMouseTracking(True)
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 8)
+        bl.setSpacing(2)
+
+        # Cover / logo
+        self._logo_label = self._build_logo()
+        bl.addWidget(self._logo_label)
+
+        # INPUT SOURCE
+        bl.addWidget(self._mk_section("INPUT SOURCE"))
         radio_row = QHBoxLayout()
         radio_row.setContentsMargins(10, 0, 10, 0)
-        radio_row.setSpacing(0)
         self.rb_single = QRadioButton("Single image")
         self.rb_folder = QRadioButton("Image folder")
         self.rb_single.setChecked(True)
         radio_row.addWidget(self.rb_single)
         radio_row.addWidget(self.rb_folder)
         radio_row.addStretch()
-        layout.addLayout(radio_row)
+        bl.addLayout(radio_row)
+        self.input_btn = self._mk_btn("Browse", self._browse_input)
+        bl.addWidget(self.input_btn)
+        self.input_label = self._mk_path_lbl("Nothing selected")
+        bl.addWidget(self.input_label)
 
-        self.input_button = self._btn("Browse", self._browse_input)
-        layout.addWidget(self.input_button)
-        self.input_label = self._path_lbl("Nothing selected")
-        layout.addWidget(self.input_label)
+        # OUTPUT FOLDER
+        bl.addWidget(self._mk_section("OUTPUT FOLDER"))
+        self.out_btn = self._mk_btn("Select Output Folder", self._browse_output)
+        bl.addWidget(self.out_btn)
+        self.output_label = self._mk_path_lbl("Same as input (default)")
+        bl.addWidget(self.output_label)
 
-        # ── OUTPUT FOLDER ──────────────────────────────────────────────
-        layout.addWidget(self._section("OUTPUT FOLDER"))
-        self.out_button = self._btn("Select Output Folder", self._browse_output)
-        layout.addWidget(self.out_button)
-        self.output_label = self._path_lbl("Same as input (default)")
-        layout.addWidget(self.output_label)
-
-        # ── MODEL ──────────────────────────────────────────────────────
-        layout.addWidget(self._section("MODEL"))
+        # MODEL
+        bl.addWidget(self._mk_section("MODEL"))
         self.model_combo = QComboBox()
         self.model_combo.currentIndexChanged.connect(self._refresh_model_desc)
-        layout.addWidget(self.model_combo)
-        self.model_desc = QLabel("")
-        self.model_desc.setStyleSheet("color: #888888; font-size: 11px; margin: 0px 14px 4px 14px;")
-        layout.addWidget(self.model_desc)
+        bl.addWidget(self.model_combo)
+        self.model_desc = QLabel()
+        self.model_desc.setStyleSheet(_MODEL_DESC_STYLE)
+        self.model_desc.setWordWrap(True)
+        bl.addWidget(self.model_desc)
         self._populate_models()
 
-        # ── OUTPUT FORMAT ──────────────────────────────────────────────
-        layout.addWidget(self._section("OUTPUT FORMAT"))
+        # OUTPUT FORMAT
+        bl.addWidget(self._mk_section("OUTPUT FORMAT"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["JPEG", "PNG", "WEBP"])
-        self.format_combo.setCurrentIndex(0)
-        layout.addWidget(self.format_combo)
+        self.format_combo.addItems(_FORMAT_OPTIONS)
+        bl.addWidget(self.format_combo)
 
-        # ── TARGET FILE SIZE ──────────────────────────────────────────
-        layout.addWidget(self._section("TARGET FILE SIZE"))
+        # TARGET FILE SIZE
+        bl.addWidget(self._mk_section("TARGET FILE SIZE"))
         self.size_combo = QComboBox()
-        self.size_combo.addItems(["No limit", "500 KB", "700 KB", "1 MB", "2 MB"])
-        layout.addWidget(self.size_combo)
+        self.size_combo.addItems(_SIZE_OPTIONS)
+        bl.addWidget(self.size_combo)
 
-        # ── Progress ──────────────────────────────────────────────────
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        self.progress.setFormat(" %v / %m")
-        self.progress.setFixedHeight(28)
-        layout.addWidget(self.progress)
+        bl.addStretch(1)
+        scroll.setWidget(body)
+        return scroll
 
-        # ── Log ────────────────────────────────────────────────────────
-        self.log_label = QLabel("Ready.")
-        self.log_label.setStyleSheet(LOG_STYLE)
-        self.log_label.setWordWrap(True)
-        self.log_label.setFixedHeight(66)
-        self.log_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        layout.addWidget(self.log_label)
+    # ── Pinned bottom panel ───────────────────────────────────────────────────
+    def _build_bottom_panel(self) -> ProgressPanel:
+        self._panel = ProgressPanel(self)
+        self._panel.start_clicked.connect(self._start_upscale)
+        return self._panel
 
-        # ── Start button ──────────────────────────────────────────────
-        self.start_btn = self._btn("Start Upscaling", self._start_upscale, START_BTN_STYLE)
-        layout.addWidget(self.start_btn)
+    # ── Cover / logo image ────────────────────────────────────────────────────
+    def _build_logo(self) -> QLabel:
+        lbl = QLabel(self)
+        lbl.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        lbl.setStyleSheet(
+            "background: transparent; border: none; margin: 0; padding: 0;"
+        )
+        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.setLayout(layout)
+        cover = _get_cover_path()
+        self._raw_pixmap = QPixmap(cover) if cover else QPixmap()
 
-    # ── factories ──────────────────────────────────────────────────────────────
+        if not self._raw_pixmap.isNull():
+            lbl.setPixmap(
+                self._raw_pixmap.scaledToWidth(self.width(), Qt.SmoothTransformation)
+            )
+        else:
+            lbl.setText("TinyImgApp")
+            lbl.setStyleSheet(_FALLBACK_LOGO_STYLE)
 
-    def _btn(self, text, slot, style=None):
-        b = QPushButton(text, self)
-        b.clicked.connect(slot)
-        if style:
-            b.setStyleSheet(style)
-        return b
-
-    def _section(self, text):
-        lbl = QLabel(text, self)
-        lbl.setStyleSheet(SECTION_LABEL_STYLE)
         return lbl
 
-    def _path_lbl(self, text):
+    # =========================================================================
+    # Widget micro-factories
+    # =========================================================================
+
+    def _mk_btn(self, text: str, slot, style: Optional[str] = None) -> QPushButton:
+        btn = QPushButton(text, self)
+        btn.clicked.connect(slot)
+        if style:
+            btn.setStyleSheet(style)
+        return btn
+
+    def _mk_section(self, text: str) -> QLabel:
         lbl = QLabel(text, self)
-        lbl.setStyleSheet(PATH_LABEL_STYLE)
+        lbl.setStyleSheet(_SECTION_STYLE)
+        return lbl
+
+    def _mk_path_lbl(self, text: str) -> QLabel:
+        lbl = QLabel(text, self)
+        lbl.setStyleSheet(_PATH_STYLE)
         lbl.setWordWrap(True)
         return lbl
 
-    def _build_title_bar(self):
-        bar = QHBoxLayout()
-        close_btn = CloseButton(self)
-        close_btn.clicked.connect(self.close)
-        bar.addWidget(close_btn, alignment=Qt.AlignRight)
-        return bar
+    # =========================================================================
+    # Qt event overrides
+    # =========================================================================
 
-    def _build_logo(self):
-        lbl = QLabel(self)
-        cover_path = get_resource_path(os.path.join("static", "cover.png"))
-        pixmap = QPixmap(cover_path)
-        if not pixmap.isNull():
-            # Scale to full width, preserve aspect ratio – height auto
-            pixmap = pixmap.scaledToWidth(self.APP_WIDTH, Qt.SmoothTransformation)
-        lbl.setPixmap(pixmap)
-        lbl.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        lbl.setStyleSheet("background: transparent; border: none; margin: 0; padding: 0;")
-        lbl.setObjectName("Logo")
-        return lbl
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not getattr(self, "_raw_pixmap", QPixmap()).isNull():
+            self._logo_label.setPixmap(
+                self._raw_pixmap.scaledToWidth(self.width(), Qt.SmoothTransformation)
+            )
 
-    # ── UI logic ─────────────────────────────────────────────────────
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
+        d = self._hit_test(event.pos())
+        if d != _RNONE:
+            self._resize_dir    = d
+            self._resize_origin = event.globalPos()
+            self._resize_rect   = self.geometry()
+            self._drag_pos      = None
+        else:
+            self._resize_dir = _RNONE
+            self._drag_pos   = event.globalPos() - self.frameGeometry().topLeft()
 
-    def _populate_models(self):
+    def mouseMoveEvent(self, event) -> None:
+        if event.buttons() == Qt.LeftButton:
+            if self._resize_dir != _RNONE and self._resize_origin is not None:
+                self._do_resize(event.globalPos())
+            elif self._drag_pos is not None:
+                self.move(event.globalPos() - self._drag_pos)
+        else:
+            self._apply_resize_cursor(self._hit_test(event.pos()))
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._resize_dir    = _RNONE
+        self._resize_origin = None
+        self._resize_rect   = None
+        self._drag_pos      = None
+        self.unsetCursor()
+
+    def closeEvent(self, event) -> None:
+        if self._worker and self._worker.isRunning():
+            _log.info("Terminating running worker on close.")
+            self._worker.terminate()
+            self._worker.wait()
+        event.accept()
+
+    # =========================================================================
+    # Edge-resize helpers
+    # =========================================================================
+
+    def _hit_test(self, pos: QPoint) -> int:
+        """Return a bitmask for the window edges under *pos* (widget-local)."""
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        d = _RNONE
+        if x <= GRIP_PX:       d |= _RLEFT
+        if x >= w - GRIP_PX:   d |= _RRIGHT
+        if y <= GRIP_PX:       d |= _RTOP
+        if y >= h - GRIP_PX:   d |= _RBOT
+        return d
+
+    def _apply_resize_cursor(self, direction: int) -> None:
+        if direction == _RNONE:
+            self.unsetCursor()
+        else:
+            self.setCursor(_CURSOR_MAP.get(direction, Qt.ArrowCursor))
+
+    def _do_resize(self, global_pos: QPoint) -> None:
+        delta      = global_pos - self._resize_origin
+        r          = QRect(self._resize_rect)
+        mn_w, mn_h = self.minimumWidth(), self.minimumHeight()
+        mx_w, mx_h = self.maximumWidth(), self.maximumHeight()
+        d          = self._resize_dir
+
+        if d & _RRIGHT:
+            r.setRight(max(r.left() + mn_w, min(r.left() + mx_w, r.right() + delta.x())))
+        if d & _RLEFT:
+            r.setLeft(min(r.right() - mn_w, r.left() + delta.x()))
+        if d & _RBOT:
+            r.setBottom(max(r.top() + mn_h, min(r.top() + mx_h, r.bottom() + delta.y())))
+        if d & _RTOP:
+            r.setTop(min(r.bottom() - mn_h, r.top() + delta.y()))
+
+        self.setGeometry(r)
+
+    # =========================================================================
+    # Model combo
+    # =========================================================================
+
+    def _populate_models(self) -> None:
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
-        models = sorted(MODEL_REGISTRY.items(), key=lambda x: (x[1].scale, x[0]))
-        for name, cfg in models:
+        for name, cfg in sorted(
+            MODEL_REGISTRY.items(), key=lambda kv: (kv[1].scale, kv[0])
+        ):
             self.model_combo.addItem(f"{name}  (×{cfg.scale})", name)
         self.model_combo.blockSignals(False)
         self._refresh_model_desc()
 
-    def _refresh_model_desc(self):
-        idx = self.model_combo.currentIndex()
-        if idx >= 0:
-            name = self.model_combo.itemData(idx)
-            cfg = MODEL_REGISTRY.get(name)
-            self.model_desc.setText(cfg.description if cfg else "")
-        else:
-            self.model_desc.setText("")
+    def _refresh_model_desc(self) -> None:
+        idx  = self.model_combo.currentIndex()
+        name = self.model_combo.itemData(idx) if idx >= 0 else None
+        cfg  = MODEL_REGISTRY.get(name) if name else None
+        self.model_desc.setText(cfg.description if cfg else "")
 
-    def _browse_input(self):
+    # =========================================================================
+    # File / folder browsers
+    # =========================================================================
+
+    def _browse_input(self) -> None:
         if self.rb_single.isChecked():
             path, _ = QFileDialog.getOpenFileName(
                 self, "Select Image", "",
-                "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif)"
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif)",
             )
             if path:
                 self._input_paths = [path]
@@ -478,115 +670,140 @@ class UpscalerApp(QWidget):
                 ]
                 self._input_paths = paths
                 n = len(paths)
-                self.input_label.setText(f"▸  {folder}  ({n} image{'s' if n != 1 else ''})")
+                self.input_label.setText(
+                    f"▸  {folder}  ({n} image{'s' if n != 1 else ''})"
+                )
 
-    def _browse_output(self):
+    def _browse_output(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
             self._output_dir = folder
             self.output_label.setText(f"▸  {folder}")
 
-    # ── Start upscaling ─────────────────────────────────────────────
+    # =========================================================================
+    # Upscale job
+    # =========================================================================
 
-    def _start_upscale(self):
+    def _validate(self) -> Optional[str]:
+        """Return a human-readable error string, or ``None`` when inputs are valid."""
         if not self._input_paths:
-            AlertDialog(self, "Please select an image or folder.").exec_()
+            return "Please select an image or folder."
+        if self.model_combo.currentIndex() < 0:
+            return "Please select a model."
+        if self._worker and self._worker.isRunning():
+            return "An upscale job is already in progress."
+        return None
+
+    def _start_upscale(self) -> None:
+        err = self._validate()
+        if err:
+            AlertDialog(self, err).exec_()
             return
 
-        idx = self.model_combo.currentIndex()
-        if idx < 0:
-            AlertDialog(self, "Please select a model.").exec_()
-            return
-        model_name = self.model_combo.itemData(idx)
-
-        fmt = self.format_combo.currentText().lower()
-        target_text = self.size_combo.currentText()
-        if target_text == "No limit":
-            target_kb = None
-        else:
-            val, unit = target_text.split()
-            target_kb = int(val) * (1024 if unit == "MB" else 1)
+        model_name = self.model_combo.itemData(self.model_combo.currentIndex())
+        fmt        = self.format_combo.currentText().lower()
+        target_kb  = _parse_target_kb(self.size_combo.currentText())
 
         if self._output_dir:
             out_dir = self._output_dir
         else:
-            base = Path(self._input_paths[0])
+            base    = Path(self._input_paths[0])
             out_dir = str((base.parent if base.is_file() else base) / "upscaled")
 
-        cfg = UpscalerConfig(
-            model_name=model_name,
-            tile=512,
-            outscale=None,
-            auto_download=True,
-        )
-
-        if (self._upscaler is None or self._upscaler.config.model_name != model_name):
+        # Re-initialise only when the selected model changes.
+        if self._upscaler is None or self._upscaler.config.model_name != model_name:
             try:
-                self._upscaler = RealESRGANUpscaler(cfg)
-            except Exception as e:
-                AlertDialog(self, f"Failed to initialise upscaler:\n{e}", is_error=True).exec_()
+                self._upscaler = RealESRGANUpscaler(
+                    UpscalerConfig(
+                        model_name=model_name,
+                        models_dir=_get_models_dir(),
+                        tile=512,
+                        outscale=None,
+                        auto_download=True,
+                    )
+                )
+            except Exception as exc:
+                _log.exception("Failed to initialise upscaler")
+                AlertDialog(
+                    self, f"Failed to initialise upscaler:\n{exc}", is_error=True
+                ).exec_()
                 return
 
         self._worker = UpscaleWorker(
             self._upscaler, self._input_paths, out_dir, fmt, target_kb
         )
         self._worker.progress.connect(self._on_progress)
-        self._worker.row_done.connect(self._on_row)
+        self._worker.row_done.connect(self._panel.append_log)
         self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
+        self._worker.error.connect(self._on_worker_error)
 
-        self.start_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.log_label.setText("[INFO] Starting upscale…")
+        self._set_busy(True)
+        self._panel.reset_progress(len(self._input_paths))
+        self._panel.set_log("[INFO] Starting upscale…")
         self._worker.start()
+        _log.info(
+            "Job started: model=%s  fmt=%s  target_kb=%s  files=%d",
+            model_name, fmt, target_kb, len(self._input_paths),
+        )
 
-    # ── Worker callbacks ────────────────────────────────────────────
+    # =========================================================================
+    # Worker signal callbacks
+    # =========================================================================
 
-    def _on_progress(self, done, total):
-        self.progress.setMaximum(max(total, 1))
-        self.progress.setValue(done)
+    def _on_progress(self, done: int, total: int) -> None:
+        self._panel.set_progress(done, total)
 
-    def _on_row(self, msg):
-        lines = [l for l in self.log_label.text().split("\n") if l] + [msg]
-        self.log_label.setText("\n".join(lines[-3:]))
-
-    def _on_finished(self, results):
-        saved = sum(1 for r in results if r["status"] == "saved")
-        skipped = sum(1 for r in results if r["status"] == "skipped")
-        errors = sum(1 for r in results if r["status"] == "error")
+    def _on_finished(self, results: list) -> None:
+        saved    = sum(1 for r in results if r["status"] == "saved")
+        skipped  = sum(1 for r in results if r["status"] == "skipped")
+        errors   = sum(1 for r in results if r["status"] == "error")
         total_mb = sum(r["size_kb"] for r in results if r["status"] == "saved") / 1024
-        self.start_btn.setEnabled(True)
-        self.log_label.setText(f"[DONE] saved={saved} ({total_mb:.1f} MB) skipped={skipped} errors={errors}")
-        DoneDialog(self, saved, skipped, errors, total_mb, self._output_dir or "default").exec_()
 
-    def _on_error(self, msg):
-        self.start_btn.setEnabled(True)
-        self.log_label.setText(f"[ERROR] {msg}")
-        AlertDialog(self, f"Upscaling failed:\n{msg}", is_error=True).exec_()
+        self._set_busy(False)
+        self._panel.set_log(
+            f"[DONE] saved={saved} ({total_mb:.1f} MB)  "
+            f"skipped={skipped}  errors={errors}"
+        )
+        _log.info(
+            "Job finished: saved=%d  skipped=%d  errors=%d", saved, skipped, errors
+        )
+        DoneDialog(
+            self, saved, skipped, errors, total_mb,
+            self._output_dir or "default",
+        ).exec_()
 
-    # ── Window drag ──────────────────────────────────────────────────
+    def _on_worker_error(self, message: str) -> None:
+        _log.error("Worker error: %s", message)
+        self._set_busy(False)
+        self._panel.set_log(f"[ERROR] {message}")
+        AlertDialog(self, f"Upscaling failed:\n{message}", is_error=True).exec_()
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.oldPos = event.globalPos()
+    # =========================================================================
+    # UI state helpers
+    # =========================================================================
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton:
-            delta = QPoint(event.globalPos() - self.oldPos)
-            self.move(self.x() + delta.x(), self.y() + delta.y())
-            self.oldPos = event.globalPos()
+    def _set_busy(self, busy: bool) -> None:
+        """Toggle all interactive controls as a single unit."""
+        for widget in (
+            self.rb_single,
+            self.rb_folder,
+            self.input_btn,
+            self.out_btn,
+            self.model_combo,
+            self.format_combo,
+            self.size_combo,
+        ):
+            widget.setEnabled(not busy)
+        self._panel.set_busy(busy)
 
-    def closeEvent(self, event):
-        if self._worker and self._worker.isRunning():
-            self._worker.terminate()
-            self._worker.wait()
-        event.accept()
 
-
-# ── Entry point ──────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main() -> None:
     app = QApplication(sys.argv)
     window = UpscalerApp()
     window.show()
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
