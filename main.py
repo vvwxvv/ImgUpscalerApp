@@ -21,6 +21,15 @@ from PyQt5.QtWidgets import (
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
+try:
+    import torch
+    import torchvision
+    import torchvision.transforms
+    import torchvision.transforms.functional
+except ImportError as e:
+    print(f"Warning: torch/torchvision not available: {e}")
+
+
 from src.assets.real_esrGAN_upscaler import (
     RealESRGANUpscaler,
     UpscalerConfig,
